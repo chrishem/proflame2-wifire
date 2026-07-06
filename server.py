@@ -5,7 +5,8 @@ server.py: Flask REST server for the Proflame 2 fireplace controller.
 
 import logging
 import RPi.GPIO as GPIO
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, Response, jsonify, abort
+import json
 from fireplace import Fireplace
 
 logging.basicConfig(level=logging.INFO)
@@ -68,44 +69,41 @@ def parse_int(data, lo=0, hi=6):
 
 @app.route("/", methods=['GET'])
 def index():
-    return jsonify({
-        "wifire": "Proflame 2 Fireplace Controller",
-        "endpoints": {
-            "fireplace": {
-                "GET  /state":       "Full fireplace state",
-                "PUT  /state":       "Set multiple params (JSON body)",
-                "GET  /serial":      "Remote serial number",
-                "GET  /power":       "Power state",
-                "PUT  /power":       "Set power (true/false)",
-                "GET  /flame":       "Flame level (0-6)",
-                "PUT  /flame":       "Set flame level (0-6)",
-                "GET  /fan":         "Fan level (0-6)",
-                "PUT  /fan":         "Set fan level (0-6)",
-                "GET  /light":       "Light level (0-6)",
-                "PUT  /light":       "Set light level (0-6)",
-                "GET  /pilot":       "Pilot state",
-                "PUT  /pilot":       "Set pilot (true/false)",
-                "GET  /thermostat":  "Thermostat state",
-                "PUT  /thermostat":  "Set thermostat (true/false)",
-                "GET  /aux":         "Aux power state",
-                "PUT  /aux":         "Set aux power (true/false)",
-                "GET  /front":       "Front flame state",
-                "PUT  /front":       "Set front flame (true/false)",
-            },
-            "gpio": {
-                "GET  /gpio/<pin>/mode":     "Get pin mode (input/output/pwm)",
-                "PUT  /gpio/<pin>/mode":     "Set pin mode (body: input/output/pwm)",
-                "GET  /gpio/<pin>/pull":     "Get pull resistor (up/down/off)",
-                "PUT  /gpio/<pin>/pull":     "Set pull resistor, input mode only (body: up/down/off)",
-                "GET  /gpio/<pin>/state":    "Get output state, output mode only",
-                "PUT  /gpio/<pin>/state":    "Set output high/low, output mode only (body: true/false)",
-                "GET  /gpio/<pin>/reading":  "Read actual pin level (any mode)",
-                "GET  /gpio/<pin>/pwm":      "Get PWM settings, pwm mode only",
-                "PUT  /gpio/<pin>/pwm":      "Set PWM, pwm mode only (body: {frequency, duty_cycle})",
-                "DELETE /gpio/<pin>/pwm":    "Stop PWM",
-            }
-        }
-    })
+    method_colors = {'GET': '#4caf78', 'PUT': '#c9922a', 'POST': '#7a9cc9', 'DELETE': '#d94f3a'}
+
+    rows = []
+    for rule in sorted(app.url_map.iter_rules(), key=lambda r: r.rule):
+        if rule.rule == '/static/<path:filename>':
+            continue
+        for method in sorted(rule.methods - {'HEAD', 'OPTIONS'}):
+            color = method_colors.get(method, '#aaa')
+            rows.append(
+                f'<tr>'
+                f'<td style="color:{color};white-space:nowrap;width:1%;padding:0.4em 0.8em">{method}</td>'
+                f'<td style="color:#7a9cc9;white-space:nowrap;width:1%;padding:0.4em 0.8em 0.4em 0">{rule.rule}</td>'
+                f'</tr>'
+            )
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>wifire API</title>
+  <style>
+    body {{ font-family: monospace; max-width: 700px; margin: 2em auto; background: #1a1a1a; color: #e0e0e0; padding: 0 1em; }}
+    h1 {{ color: #e8530a; }}
+    p {{ color: #aaa; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    tr {{ border-bottom: 1px solid #2a2a2a; }}
+  </style>
+</head>
+<body>
+  <h1>wifire</h1>
+  <p>Proflame 2 Fireplace Controller &mdash; GPIO pins default to floating input on first use.</p>
+  <table>{''.join(rows)}</table>
+</body>
+</html>"""
+    return Response(html, mimetype="text/html")
 
 
 # ── Fireplace routes ──────────────────────────────────────────────────────────
