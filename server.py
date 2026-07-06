@@ -1,30 +1,10 @@
 #!/usr/bin/env python3
 """
 server.py: Flask REST server for the Proflame 2 fireplace controller.
-
-Endpoints:
-  GET  /state              -- full fireplace state as JSON
-  PUT  /state              -- set multiple params at once (JSON body)
-  GET  /power              -- current power state
-  PUT  /power              -- set power (body: true/false)
-  GET  /flame              -- current flame level
-  PUT  /flame              -- set flame level (body: 0-6)
-  GET  /fan                -- current fan level
-  PUT  /fan                -- set fan level (body: 0-6)
-  GET  /light              -- current light level
-  PUT  /light              -- set light level (body: 0-6)
-  GET  /pilot              -- current pilot state
-  PUT  /pilot              -- set pilot (body: true/false)
-  GET  /thermostat         -- current thermostat state
-  PUT  /thermostat         -- set thermostat (body: true/false)
-  GET  /aux                -- current aux state
-  PUT  /aux                -- set aux (body: true/false)
-  GET  /front              -- current front flame state
-  PUT  /front              -- set front flame (body: true/false)
-  GET  /serial             -- current serial number
 """
 
 import logging
+import RPi.GPIO as GPIO
 from flask import Flask, request, jsonify, abort
 from fireplace import Fireplace
 
@@ -34,11 +14,38 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 fp  = Fireplace()
 
+# ── GPIO state ────────────────────────────────────────────────────────────────
+
+_gpio_pins = {}
+
+
+def _pin_state(pin):
+    """Get or initialize state for a GPIO pin. Default: floating input."""
+    if pin not in _gpio_pins:
+        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_OFF)
+        _gpio_pins[pin] = {
+            'mode':     'input',
+            'pull':     'off',
+            'state':    False,
+            'pwm':      None,
+            'pwm_freq': 0,
+            'pwm_duty': 0,
+        }
+    return _gpio_pins[pin]
+
+
+def _cleanup_pwm(ps):
+    """Stop PWM on a pin if running."""
+    if ps['pwm'] is not None:
+        ps['pwm'].stop()
+        ps['pwm']      = None
+        ps['pwm_freq'] = 0
+        ps['pwm_duty'] = 0
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def parse_bool(data):
-    """Parse request body as bool. Accepts 'true'/'false' or '1'/'0'."""
     s = data.decode().strip().lower()
     if s in ('true', '1'):
         return True
@@ -48,7 +55,6 @@ def parse_bool(data):
 
 
 def parse_int(data, lo=0, hi=6):
-    """Parse request body as int within [lo, hi]."""
     try:
         v = int(data.decode().strip())
     except ValueError:
@@ -58,7 +64,51 @@ def parse_int(data, lo=0, hi=6):
     return v
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── API index ─────────────────────────────────────────────────────────────────
+
+@app.route("/", methods=['GET'])
+def index():
+    return jsonify({
+        "wifire": "Proflame 2 Fireplace Controller",
+        "endpoints": {
+            "fireplace": {
+                "GET  /state":       "Full fireplace state",
+                "PUT  /state":       "Set multiple params (JSON body)",
+                "GET  /serial":      "Remote serial number",
+                "GET  /power":       "Power state",
+                "PUT  /power":       "Set power (true/false)",
+                "GET  /flame":       "Flame level (0-6)",
+                "PUT  /flame":       "Set flame level (0-6)",
+                "GET  /fan":         "Fan level (0-6)",
+                "PUT  /fan":         "Set fan level (0-6)",
+                "GET  /light":       "Light level (0-6)",
+                "PUT  /light":       "Set light level (0-6)",
+                "GET  /pilot":       "Pilot state",
+                "PUT  /pilot":       "Set pilot (true/false)",
+                "GET  /thermostat":  "Thermostat state",
+                "PUT  /thermostat":  "Set thermostat (true/false)",
+                "GET  /aux":         "Aux power state",
+                "PUT  /aux":         "Set aux power (true/false)",
+                "GET  /front":       "Front flame state",
+                "PUT  /front":       "Set front flame (true/false)",
+            },
+            "gpio": {
+                "GET  /gpio/<pin>/mode":     "Get pin mode (input/output/pwm)",
+                "PUT  /gpio/<pin>/mode":     "Set pin mode (body: input/output/pwm)",
+                "GET  /gpio/<pin>/pull":     "Get pull resistor (up/down/off)",
+                "PUT  /gpio/<pin>/pull":     "Set pull resistor, input mode only (body: up/down/off)",
+                "GET  /gpio/<pin>/state":    "Get output state, output mode only",
+                "PUT  /gpio/<pin>/state":    "Set output high/low, output mode only (body: true/false)",
+                "GET  /gpio/<pin>/reading":  "Read actual pin level (any mode)",
+                "GET  /gpio/<pin>/pwm":      "Get PWM settings, pwm mode only",
+                "PUT  /gpio/<pin>/pwm":      "Set PWM, pwm mode only (body: {frequency, duty_cycle})",
+                "DELETE /gpio/<pin>/pwm":    "Stop PWM",
+            }
+        }
+    })
+
+
+# ── Fireplace routes ──────────────────────────────────────────────────────────
 
 @app.route("/state", methods=['GET', 'PUT'])
 def state():
@@ -139,10 +189,115 @@ def front():
     return jsonify({'front': fp.front})
 
 
+# ── GPIO routes ───────────────────────────────────────────────────────────────
+
+@app.route("/gpio/<int:pin>/mode", methods=['GET', 'PUT'])
+def gpio_mode(pin):
+    ps = _pin_state(pin)
+    if request.method == 'GET':
+        return jsonify({'pin': pin, 'mode': ps['mode']})
+
+    mode = request.data.decode().strip().lower()
+    if mode not in ('input', 'output', 'pwm'):
+        abort(400, "mode must be input, output, or pwm")
+
+    _cleanup_pwm(ps)
+    pull_map = {'up': GPIO.PUD_UP, 'down': GPIO.PUD_DOWN, 'off': GPIO.PUD_OFF}
+    pull = pull_map.get(ps['pull'], GPIO.PUD_OFF)
+
+    if mode == 'input':
+        GPIO.setup(pin, GPIO.IN, pull_up_down=pull)
+    elif mode in ('output', 'pwm'):
+        GPIO.setup(pin, GPIO.OUT, initial=GPIO.LOW)
+        ps['state'] = False
+
+    ps['mode'] = mode
+    return jsonify({'pin': pin, 'mode': ps['mode']})
+
+
+@app.route("/gpio/<int:pin>/pull", methods=['GET', 'PUT'])
+def gpio_pull(pin):
+    ps = _pin_state(pin)
+    if request.method == 'GET':
+        return jsonify({'pin': pin, 'pull': ps['pull']})
+
+    if ps['mode'] != 'input':
+        abort(400, f"Pull resistor only applies in input mode (currently: {ps['mode']})")
+
+    pull = request.data.decode().strip().lower()
+    if pull not in ('up', 'down', 'off'):
+        abort(400, "pull must be up, down, or off")
+
+    pull_map = {'up': GPIO.PUD_UP, 'down': GPIO.PUD_DOWN, 'off': GPIO.PUD_OFF}
+    GPIO.setup(pin, GPIO.IN, pull_up_down=pull_map[pull])
+    ps['pull'] = pull
+    return jsonify({'pin': pin, 'pull': ps['pull']})
+
+
+@app.route("/gpio/<int:pin>/state", methods=['GET', 'PUT'])
+def gpio_state(pin):
+    ps = _pin_state(pin)
+    if ps['mode'] != 'output':
+        abort(400, f"Pin must be in output mode to get/set state (currently: {ps['mode']})")
+
+    if request.method == 'GET':
+        return jsonify({'pin': pin, 'state': ps['state']})
+
+    value = parse_bool(request.data)
+    GPIO.output(pin, GPIO.HIGH if value else GPIO.LOW)
+    ps['state'] = value
+    return jsonify({'pin': pin, 'state': ps['state']})
+
+
+@app.route("/gpio/<int:pin>/reading", methods=['GET'])
+def gpio_reading(pin):
+    _pin_state(pin)
+    return jsonify({'pin': pin, 'reading': bool(GPIO.input(pin))})
+
+
+@app.route("/gpio/<int:pin>/pwm", methods=['GET', 'PUT', 'DELETE'])
+def gpio_pwm(pin):
+    ps = _pin_state(pin)
+    if ps['mode'] != 'pwm':
+        abort(400, f"Pin must be in pwm mode (currently: {ps['mode']})")
+
+    if request.method == 'GET':
+        return jsonify({
+            'pin':        pin,
+            'active':     ps['pwm'] is not None,
+            'frequency':  ps['pwm_freq'],
+            'duty_cycle': ps['pwm_duty'],
+        })
+
+    if request.method == 'DELETE':
+        _cleanup_pwm(ps)
+        return jsonify({'pin': pin, 'active': False})
+
+    data = request.get_json(force=True)
+    freq = float(data.get('frequency', 1000))
+    duty = float(data.get('duty_cycle', 50))
+
+    if not (0 < freq <= 1_000_000):
+        abort(400, "frequency must be between 1 and 1000000 Hz")
+    if not (0 <= duty <= 100):
+        abort(400, "duty_cycle must be between 0 and 100")
+
+    _cleanup_pwm(ps)
+    pwm = GPIO.PWM(pin, freq)
+    pwm.start(duty)
+    ps['pwm']      = pwm
+    ps['pwm_freq'] = freq
+    ps['pwm_duty'] = duty
+
+    return jsonify({'pin': pin, 'active': True, 'frequency': freq, 'duty_cycle': duty})
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     try:
         app.run(host='0.0.0.0', port=5000, debug=False)
     finally:
+        for ps in _gpio_pins.values():
+            _cleanup_pwm(ps)
         fp.cleanup()
