@@ -75,14 +75,19 @@ def index():
     for rule in sorted(app.url_map.iter_rules(), key=lambda r: r.rule):
         if rule.rule == '/static/<path:filename>':
             continue
-        for method in sorted(rule.methods - {'HEAD', 'OPTIONS'}):
-            color = method_colors.get(method, '#aaa')
-            rows.append(
-                f'<tr>'
-                f'<td style="color:{color};white-space:nowrap;width:1%;padding:0.4em 0.8em">{method}</td>'
-                f'<td style="color:#7a9cc9;white-space:nowrap;width:1%;padding:0.4em 0.8em 0.4em 0">{rule.rule}</td>'
-                f'</tr>'
-            )
+        method_order = ['GET', 'PUT', 'POST', 'PATCH', 'DELETE']
+        methods = sorted(rule.methods - {'HEAD', 'OPTIONS'}, key=lambda m: method_order.index(m) if m in method_order else 99)
+        method_spans = ' '.join(
+            f'<span style="color:{method_colors.get(m, "#aaa")}">{m}</span>'
+            for m in methods
+        )
+        escaped_rule = rule.rule.replace('<', '&lt;').replace('>', '&gt;')
+        rows.append(
+            f'<tr>'
+            f'<td style="color:#7a9cc9;white-space:nowrap;width:1%;padding:0.4em 0.8em 0.4em 0">{escaped_rule}</td>'
+            f'<td style="white-space:nowrap;padding:0.4em 0.8em">{method_spans}</td>'
+            f'</tr>'
+        )
 
     html = f"""<!DOCTYPE html>
 <html>
@@ -104,7 +109,6 @@ def index():
 </body>
 </html>"""
     return Response(html, mimetype="text/html")
-
 
 # ── Fireplace routes ──────────────────────────────────────────────────────────
 
@@ -294,7 +298,7 @@ def gpio_pwm(pin):
 
 if __name__ == "__main__":
     try:
-        app.run(host='0.0.0.0', port=5000, debug=False)
+        app.run(host='0.0.0.0', port=5001, debug=True)
     finally:
         for ps in _gpio_pins.values():
             _cleanup_pwm(ps)
