@@ -1,0 +1,3 @@
+https://pypi.org/project/cc1101/
+https://github.com/johnellinwood/smartfire
+https://github.com/j2deen/proflame2-esp/
