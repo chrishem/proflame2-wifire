@@ -88,7 +88,11 @@ class FireplaceState:
     pilot_cpi: bool = False       # True = CPI, False = IPI
     thermostat: bool = False
     light: int = 0                # 0-6
-    front: bool = False           # front flame / flame split
+    front: bool = False           # CONFIRMED via direct testing (2026-07-24): on THIS
+                                   # unit, this bit controls the back-row/secondary
+                                   # burner - despite the protocol calling it "front".
+                                   # This is unit-specific wiring, not a universal
+                                   # Proflame2 meaning - other installations may differ.
     fan: int = 0                  # 0-6
     aux: bool = False
     flame: int = 0                # 0-6
@@ -212,4 +216,3 @@ if __name__ == "__main__":
     print("Power-on packet symbols:", build_packet_symbols(SERIAL, power_on_state, CHECKSUM))
     print(f"Power-on burst: {len(burst_bits)} raw bits -> {len(burst_bytes)} bytes")
     print("Burst hex:", burst_bytes.hex())
-
