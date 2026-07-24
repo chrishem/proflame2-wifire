@@ -7,6 +7,16 @@ Usage:
   sudo ./test_fireplace.py --power on --flame 3 --fan 2 --light 1 --aux
   sudo ./test_fireplace.py --power off
   ./test_fireplace.py --power on --flame 1   (auto re-execs under sudo)
+  ./test_fireplace.py --power on --flame 1 --fast   (batch mode: quiet + faster)
+
+Exit codes:
+  0 = success
+  1 = radio LDO power-on failed (PWRGD never went high)
+  2 = CC1101 configure/transmit failure
+
+Always prints one final machine-parseable line regardless of --quiet:
+  RESULT: power=on flame=3 fan=2 light=0 aux=off status=ok
+  RESULT: power=on flame=3 fan=2 light=0 aux=off status=error:<message>
 
 Pin map (per WiFirePi interposer board):
   RAD_EN (LDO enable, "LDOCTRL")  GPIO27
@@ -57,6 +67,16 @@ CHECKSUM = ChecksumConstants(c1=0x7, d1=0x5, c2=0x4, d2=0xD)
 
 LDO_SETTLE_S = 0.25  # MCP1727 startup is well under this; generous margin
 
+QUIET = False       # set from --quiet in main()
+POST_DELAY_S = 1.0  # set from --fast in main()
+
+
+def log(msg):
+    """Print unless --quiet was given. Errors and the final RESULT line
+    bypass this and always print."""
+    if not QUIET:
+        print(msg)
+
 
 def set_pixel(strip, color):
     for i in range(strip.numPixels()):
@@ -69,7 +89,7 @@ def set_radio_ldo(strip: PixelStrip, turn_on: bool) -> bool:
     status on the NeoPixel.
 
     For turn_on=True: a PWRGD failure is fatal (nothing downstream can work
-    without power) - NeoPixel goes red and the script exits.
+    without power) - NeoPixel goes red and the script exits with code 1.
     For turn_on=False: a PWRGD mismatch is a warning, not fatal - there's
     nothing left to protect by aborting during cleanup, so it just returns
     False and lets the caller continue.
@@ -85,19 +105,19 @@ def set_radio_ldo(strip: PixelStrip, turn_on: bool) -> bool:
 
     if turn_on:
         if not pwrgd:
-            print("PWRGD is LOW - LDO did not come up. NeoPixel red, exiting.")
+            print("ERROR: PWRGD is LOW - LDO did not come up.", file=sys.stderr)
             set_pixel(strip, COLOR_RED)
             GPIO.output(RAD_EN, GPIO.LOW)
             sys.exit(1)
-        print("PWRGD confirmed high.")
+        log("PWRGD confirmed high.")
         set_pixel(strip, COLOR_BLUE)
         return True
     else:
         if pwrgd:
-            print("WARNING: PWRGD still HIGH after LDO off - rail may not have "
-                  "discharged yet, or PWRGD/RAD_EN wiring should be re-checked.")
+            log("WARNING: PWRGD still HIGH after LDO off - rail may not have "
+                "discharged yet, or PWRGD/RAD_EN wiring should be re-checked.")
             return False
-        print("PWRGD confirmed low - LDO cleanly disabled.")
+        log("PWRGD confirmed low - LDO cleanly disabled.")
         set_pixel(strip, COLOR_GREEN)
         return True
 
@@ -117,6 +137,10 @@ def parse_args():
                          help="Light level (0-6).")
     parser.add_argument("--aux", action="store_true",
                          help="Enable the auxiliary/secondary burner.")
+    parser.add_argument("--fast", action="store_true",
+                         help="Batch mode: shrink cosmetic post-action delays and "
+                              "suppress step-by-step output (only the final RESULT "
+                              "line and any errors print).")
     args = parser.parse_args()
 
     if args.power == "on" and (args.flame is None or args.flame == 0):
@@ -129,11 +153,20 @@ def parse_args():
     return args
 
 
+def result_line(args, status):
+    aux_desc = "on" if args.aux else "off"
+    return (f"RESULT: power={args.power} flame={args.flame} fan={args.fan} "
+            f"light={args.light} aux={aux_desc} status={status}")
+
+
 def main():
+    global QUIET, POST_DELAY_S
     args = parse_args()
+    QUIET = args.fast
+    POST_DELAY_S = 0.2 if args.fast else 1.0
 
     if os.geteuid() != 0:
-        print("Not running as root - re-executing under sudo...")
+        log("Not running as root - re-executing under sudo...")
         os.execvp("sudo", ["sudo", sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
 
     strip = PixelStrip(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA, LED_INVERT, LED_BRIGHTNESS, LED_CHANNEL)
@@ -148,15 +181,15 @@ def main():
 
     try:
         # Trusting these are already off from prior cleanup - no delay needed here.
-        print("NeoPixel off, LDO off")
+        log("NeoPixel off, LDO off")
         set_pixel(strip, COLOR_OFF)
         GPIO.output(RAD_EN, GPIO.LOW)
 
-        print("Powering on...")
-        set_radio_ldo(strip, turn_on=True)  # exits internally on PWRGD failure
+        log("Powering on...")
+        set_radio_ldo(strip, turn_on=True)  # exits(1) internally on PWRGD failure
 
-        print(f"Building and sending CC1101 command: power={args.power} "
-              f"flame={args.flame} fan={args.fan} light={args.light} aux={args.aux}")
+        log(f"Building and sending CC1101 command: power={args.power} "
+            f"flame={args.flame} fan={args.fan} light={args.light} aux={args.aux}")
         # pilot_cpi is a SEPARATE, deliberately user-controlled setting (CPI keeps
         # the pilot lit - faster ignition, wards off condensation/rust in winter;
         # IPI shuts the pilot off). It must NOT be forced by a power command, and
@@ -173,23 +206,29 @@ def main():
         burst_bits = build_burst_bits(SERIAL_NUMBER, state, CHECKSUM)
         payload = bits_to_bytes(burst_bits)
 
-        radio = CC1101TX()
-        info = radio.configure_ook_tx()
-        print(f"Configured: {info['actual_freq_hz']/1e6:.4f} MHz (PATABLE readback verified OK)")
-        radio.transmit(payload)
-        print("Transmit complete - FIFO drained cleanly, no underflow.")
+        try:
+            radio = CC1101TX()
+            info = radio.configure_ook_tx()
+            log(f"Configured: {info['actual_freq_hz']/1e6:.4f} MHz (PATABLE readback verified OK)")
+            radio.transmit(payload)
+            log("Transmit complete - FIFO drained cleanly, no underflow.")
+        except (RuntimeError, ValueError) as e:
+            print(f"ERROR: CC1101 transmit failed: {e}", file=sys.stderr)
+            set_pixel(strip, COLOR_RED)
+            print(result_line(args, f"error:{e}"))
+            sys.exit(2)
 
         set_pixel(strip, COLOR_OFF)
-        print("Delay 1s")
-        time.sleep(1)
+        time.sleep(POST_DELAY_S)
 
-        print("Powering off...")
+        log("Powering off...")
         set_radio_ldo(strip, turn_on=False)
 
-        print("Delay 1s")
-        time.sleep(1)
+        time.sleep(POST_DELAY_S)
 
         set_pixel(strip, COLOR_OFF)
+
+        print(result_line(args, "ok"))
 
     finally:
         if radio is not None:
