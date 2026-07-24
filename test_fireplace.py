@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Send a Proflame2 command to the fireplace, with NeoPixel status indication
-and LDO power sequencing via a shared set_power() helper.
+and LDO power sequencing via a shared set_radio_ldo() helper.
 
 Usage:
-  sudo ./test_power_on.py --power on --flame 3 --fan 2 --light 1 --aux
-  sudo ./test_power_on.py --power off
-  ./test_power_on.py --power on --flame 1   (auto re-execs under sudo)
+  sudo ./test_fireplace.py --power on --flame 3 --fan 2 --light 1 --aux
+  sudo ./test_fireplace.py --power off
+  ./test_fireplace.py --power on --flame 1   (auto re-execs under sudo)
 
 Pin map (per WiFirePi interposer board):
   RAD_EN (LDO enable, "LDOCTRL")  GPIO27
@@ -64,7 +64,7 @@ def set_pixel(strip, color):
     strip.show()
 
 
-def set_power(strip: PixelStrip, turn_on: bool) -> bool:
+def set_radio_ldo(strip: PixelStrip, turn_on: bool) -> bool:
     """Set the LDO on/off, wait for it to settle, verify via PWRGD, and reflect
     status on the NeoPixel.
 
@@ -106,17 +106,27 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Send a Proflame2 command to the fireplace.")
     parser.add_argument("--power", choices=["on", "off"], required=True,
                          help="Fireplace power state to request.")
-    parser.add_argument("--flame", type=int, default=0, choices=range(0, 7), metavar="0-6",
-                         help="Flame height (0-6). Note: 0 likely means 'no target "
-                              "flame' - every real-world Power:1 capture we've seen "
-                              "has a nonzero flame value.")
+    parser.add_argument("--flame", type=int, default=None, choices=range(0, 7), metavar="0-6",
+                         help="Flame height (0-6). Must be 1-6 when --power on - 0 "
+                              "means 'no target flame', a correctly-executed no-op "
+                              "that looks like the fireplace ignoring the command. "
+                              "Defaults to 0 for --power off, where it's moot.")
     parser.add_argument("--fan", type=int, default=0, choices=range(0, 7), metavar="0-6",
                          help="Fan speed (0-6).")
     parser.add_argument("--light", type=int, default=0, choices=range(0, 7), metavar="0-6",
                          help="Light level (0-6).")
     parser.add_argument("--aux", action="store_true",
                          help="Enable the auxiliary/secondary burner.")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.power == "on" and (args.flame is None or args.flame == 0):
+        parser.error("--flame must be 1-6 when --power on (0 means 'no target "
+                      "flame' - a correctly-executed no-op that looks like the "
+                      "fireplace ignoring the command)")
+    if args.flame is None:
+        args.flame = 0  # fine for --power off; visible flame level is moot
+
+    return args
 
 
 def main():
@@ -143,7 +153,7 @@ def main():
         GPIO.output(RAD_EN, GPIO.LOW)
 
         print("Powering on...")
-        set_power(strip, turn_on=True)  # exits internally on PWRGD failure
+        set_radio_ldo(strip, turn_on=True)  # exits internally on PWRGD failure
 
         print(f"Building and sending CC1101 command: power={args.power} "
               f"flame={args.flame} fan={args.fan} light={args.light} aux={args.aux}")
@@ -174,7 +184,7 @@ def main():
         time.sleep(1)
 
         print("Powering off...")
-        set_power(strip, turn_on=False)
+        set_radio_ldo(strip, turn_on=False)
 
         print("Delay 1s")
         time.sleep(1)
