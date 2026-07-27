@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Send a Proflame2 command to the fireplace, tracking persisted state between
-runs so unspecified fields carry forward instead of resetting to 0/False.
+fpctrl - Send a Proflame2 command to the fireplace, tracking persisted state
+between runs so unspecified fields carry forward instead of resetting to
+0/False.
 
 The real remote always transmits its FULL current state, not deltas - so we
 have to do the same. Any field you don't pass on the command line is read
@@ -10,13 +11,16 @@ than defaulting to 0/off, which would otherwise silently stomp on settings
 you didn't intend to change.
 
 Usage:
-  sudo ./test_fireplace.py --power on --flame 3 --fan 2 --light 1 --backburner on
-  sudo ./test_fireplace.py --power on --backburner on   (carries over flame/fan/
-                                                          light/pilot_cpi from
-                                                          last run)
-  sudo ./test_fireplace.py --power off
-  ./test_fireplace.py --power on --flame 1 --fast   (batch mode: quiet + faster)
-  ./test_fireplace.py --status   (no root needed - just prints last-known state)
+  sudo ./fpctrl.py --power on --flame 3 --fan 2 --light 1 --backburner on
+  sudo ./fpctrl.py --power on --backburner on   (carries over flame/fan/light/
+                                               pilot from last run)
+  sudo ./fpctrl.py --power off
+  sudo ./fpctrl.py --power off --pilot cpi  (pilot mode can ONLY be changed
+                                               together with --power off)
+  ./fpctrl.py --power on --flame 1              (quiet + fast by default)
+  ./fpctrl.py --power on --flame 1 --verbose    (full step-by-step output, slower
+                                               cosmetic delays for visual watching)
+  ./fpctrl.py --status                          (no root needed - prints last-known state)
 
 First run ever (no state file yet): all unspecified fields default to a
 conservative 0/off baseline, and the script prints a clear warning that this
@@ -28,7 +32,7 @@ Exit codes:
   1 = radio LDO power-on failed (PWRGD never went high)
   2 = CC1101 configure/transmit failure
 
-Always prints one final machine-parseable line regardless of --fast:
+Always prints one final machine-parseable line:
   RESULT: power=on flame=3 fan=2 light=0 backburner=off pilot=ipi status=ok
   RESULT: power=on flame=3 fan=2 light=0 backburner=off pilot=ipi status=error:<message>
 
@@ -45,7 +49,8 @@ Pin map (per WiFirePi interposer board):
   Misc spare                       GPIO23  (not used by this script)
 
 Requires root (rpi_ws281x needs /dev/mem access for DMA/PWM) - the script
-re-execs itself under sudo automatically if not already root.
+re-execs itself under sudo automatically if not already root (--status
+excepted, which needs no hardware access at all).
 """
 
 import argparse
@@ -96,14 +101,14 @@ DEFAULT_STATE = {
     "front": False,
 }
 
-QUIET = False       # set from --fast in main()
-POST_DELAY_S = 1.0  # set from --fast in main()
+VERBOSE = False       # set from --verbose/--debug in main(); default is quiet+fast
+POST_DELAY_S = 0.2    # 1.0s under --verbose, for visual NeoPixel watching
 
 
 def log(msg):
-    """Print unless --fast was given. Errors and the final RESULT line
-    bypass this and always print."""
-    if not QUIET:
+    """Routine step-tracing - only shown with --verbose/--debug. Notices,
+    warnings, and errors bypass this and always print."""
+    if VERBOSE:
         print(msg)
 
 
@@ -111,10 +116,10 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    log(f"No state file found at {STATE_FILE} - this is the first run, or it "
-        f"was deleted. Assuming baseline (power off, everything 0/off). This "
-        f"is a GUESS, not a confirmed reading - verify against the real "
-        f"fireplace if this matters.")
+    print(f"NOTE: no state file found at {STATE_FILE} - this is the first run, "
+          f"or it was deleted. Assuming baseline (power off, everything 0/off). "
+          f"This is a GUESS, not a confirmed reading - verify against the real "
+          f"fireplace if this matters.")
     return dict(DEFAULT_STATE)
 
 
@@ -159,86 +164,13 @@ def set_radio_ldo(strip: PixelStrip, turn_on: bool) -> bool:
         return True
     else:
         if pwrgd:
-            log("WARNING: PWRGD still HIGH after LDO off - rail may not have "
-                "discharged yet, or PWRGD/RAD_EN wiring should be re-checked.")
+            print("WARNING: PWRGD still HIGH after LDO off - rail may not have "
+                  "discharged yet, or PWRGD/RAD_EN wiring should be re-checked.",
+                  file=sys.stderr)
             return False
         log("PWRGD confirmed low - LDO cleanly disabled.")
         set_pixel(strip, COLOR_GREEN)
         return True
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Send a Proflame2 command to the fireplace. Any field not "
-                     "specified carries forward from the last run's state.")
-    parser.add_argument("--power", choices=["on", "off"], default=None,
-                         help="Fireplace power state to request. Required unless --status.")
-    parser.add_argument("--flame", type=int, default=None, choices=range(0, 7), metavar="0-6",
-                         help="Flame height (0-6). Must be 1-6 (explicitly or via "
-                              "carried-over state) when --power on - 0 means 'no "
-                              "target flame', a correctly-executed no-op. If "
-                              "omitted, carries forward from last run.")
-    parser.add_argument("--fan", type=int, default=None, choices=range(0, 7), metavar="0-6",
-                         help="Fan speed (0-6). If omitted, carries forward from last run.")
-    parser.add_argument("--light", type=int, default=None, choices=range(0, 7), metavar="0-6",
-                         help="Light level (0-6). If omitted, carries forward from last run.")
-    parser.add_argument("--backburner", choices=["on", "off"], default=None,
-                         help="Rear/secondary burner (library-internally this is the "
-                              "protocol's 'front' bit - confirmed 2026-07-24 that on "
-                              "this unit it controls the rear burner, not anything "
-                              "front-facing). If omitted, carries forward from last run.")
-    parser.add_argument("--pilot-cpi", choices=["cpi", "ipi"], default=None,
-                         help="Pilot mode: cpi=continuous pilot lit, ipi=pilot off. "
-                              "This is a deliberate, separate seasonal setting - "
-                              "NOT tied to power on/off. If omitted, carries "
-                              "forward from last run (never silently changed).")
-    parser.add_argument("--status", action="store_true",
-                         help="Print the last-known fireplace state and exit - no "
-                              "radio, no LDO, no root needed. This reads the "
-                              "persisted state file, which reflects what we last "
-                              "COMMANDED, not a live/confirmed reading (no receiver "
-                              "hardware exists to verify the fireplace's real state).")
-    parser.add_argument("--fast", action="store_true",
-                         help="Batch mode: shrink cosmetic post-action delays and "
-                              "suppress step-by-step output (only the final RESULT "
-                              "line and any errors print).")
-    args = parser.parse_args()
-
-    if args.status:
-        return args  # --power not required/validated in status mode
-
-    if args.power is None:
-        parser.error("--power is required unless --status is given")
-
-    return args
-
-
-def merge_state(persisted, args):
-    """Overlay explicitly-provided CLI args onto the persisted state. Fields
-    not passed on the command line keep their last-known value."""
-    merged = dict(persisted)
-    merged.pop("aux", None)  # retired - confirmed no observable effect on this unit
-    merged["power"] = (args.power == "on")
-    if args.flame is not None:
-        merged["flame"] = args.flame
-    if args.fan is not None:
-        merged["fan"] = args.fan
-    if args.light is not None:
-        merged["light"] = args.light
-    if args.backburner is not None:
-        # "backburner" is the user-facing name; the library field is still "front"
-        # (confirmed 2026-07-24 that's the bit that actually drives this on this unit)
-        merged["front"] = (args.backburner == "on")
-    if args.pilot_cpi is not None:
-        merged["pilot_cpi"] = (args.pilot_cpi == "cpi")
-    return merged
-
-
-def result_line(state, status):
-    return (f"RESULT: power={'on' if state['power'] else 'off'} "
-            f"flame={state['flame']} fan={state['fan']} light={state['light']} "
-            f"backburner={'on' if state['front'] else 'off'} "
-            f"pilot={'cpi' if state['pilot_cpi'] else 'ipi'} status={status}")
 
 
 def render_range(value, max_value=6):
@@ -262,21 +194,115 @@ def show_status():
     if "aux" in persisted:
         print("  (stale 'aux' field present in state file - no longer used, "
               "will be dropped automatically on next command)")
+    if "thermostat" in persisted:
+        print("  (stale 'thermostat' field present in state file - not used, "
+              "will be dropped automatically on next command)")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Send a Proflame2 command to the fireplace.")
+    parser.add_argument("--power", choices=["on", "off"], default=None,
+                         help="Fireplace power state to request. Required unless --status.")
+    parser.add_argument("--flame", type=int, default=None, choices=range(0, 7), metavar="0-6",
+                         help="Flame height (0-6). Must be 1-6 when --power on - 0 "
+                              "means 'no target flame', a correctly-executed no-op "
+                              "that looks like the fireplace ignoring the command. "
+                              "Defaults to 0 for --power off, where it's moot.")
+    parser.add_argument("--fan", type=int, default=None, choices=range(0, 7), metavar="0-6",
+                         help="Fan speed (0-6). If omitted, carries forward from last run.")
+    parser.add_argument("--light", type=int, default=None, choices=range(0, 7), metavar="0-6",
+                         help="Light level (0-6). If omitted, carries forward from last run. "
+                              "NOTE: at least one related product line's official manual lists "
+                              "this as 'not used' - may have no effect on this unit; unconfirmed.")
+    parser.add_argument("--backburner", choices=["on", "off"], default=None,
+                         help="Rear/secondary burner (library-internally this is the "
+                              "protocol's 'front' bit - confirmed 2026-07-24 that on "
+                              "this unit it controls the rear burner, not anything "
+                              "front-facing). If omitted, carries forward from last run.")
+    parser.add_argument("--pilot", choices=["cpi", "ipi"], default=None,
+                         help="Pilot mode: cpi=Continuous Pilot Ignition (pilot "
+                              "stays lit), ipi=Intermittent Pilot Ignition (pilot "
+                              "only lights on demand). This is a deliberate, "
+                              "separate seasonal setting - NOT tied to power on/off, "
+                              "and can ONLY be changed together with --power off "
+                              "(the fireplace must be off to switch pilot mode). If "
+                              "omitted, carries forward from last run (never "
+                              "silently changed).")
+    parser.add_argument("--status", action="store_true",
+                         help="Print the last-known fireplace state and exit - no "
+                              "radio, no LDO, no root needed. This reads the "
+                              "persisted state file, which reflects what we last "
+                              "COMMANDED, not a live/confirmed reading (no receiver "
+                              "hardware exists to verify the fireplace's real state).")
+    parser.add_argument("--verbose", "--debug", action="store_true", dest="verbose",
+                         help="Show full step-by-step output and use slower cosmetic "
+                              "delays (for watching the NeoPixel by eye). Default is "
+                              "quiet + fast (only the final RESULT line and any "
+                              "errors/warnings print).")
+    args = parser.parse_args()
+
+    if args.status:
+        return args  # --power etc. not required/validated in status mode
+
+    if args.power is None:
+        parser.error("--power is required unless --status is given")
+
+    if args.power == "on" and (args.flame is None or args.flame == 0):
+        parser.error("--flame must be 1-6 when --power on (0 means 'no target "
+                      "flame' - a correctly-executed no-op that looks like the "
+                      "fireplace ignoring the command)")
+    if args.flame is None:
+        args.flame = 0  # fine for --power off; visible flame level is moot
+
+    if args.pilot is not None and args.power != "off":
+        parser.error("--pilot can only be changed together with --power off "
+                      "(pilot mode cannot be switched while the fireplace is on)")
+
+    return args
+
+
+def merge_state(persisted, args):
+    """Overlay explicitly-provided CLI args onto the persisted state. Fields
+    not passed on the command line keep their last-known value."""
+    merged = dict(persisted)
+    merged.pop("aux", None)  # retired - confirmed no observable effect on this unit
+    merged.pop("thermostat", None)  # retired - not used on this fireplace's remote
+    merged["power"] = (args.power == "on")
+    if args.flame is not None:
+        merged["flame"] = args.flame
+    if args.fan is not None:
+        merged["fan"] = args.fan
+    if args.light is not None:
+        merged["light"] = args.light
+    if args.backburner is not None:
+        # "backburner" is the user-facing name; the library field is still "front"
+        # (confirmed 2026-07-24 that's the bit that actually drives this on this unit)
+        merged["front"] = (args.backburner == "on")
+    if args.pilot is not None:
+        merged["pilot_cpi"] = (args.pilot == "cpi")
+    return merged
+
+
+def result_line(state, status):
+    return (f"RESULT: power={'on' if state['power'] else 'off'} "
+            f"flame={state['flame']} fan={state['fan']} light={state['light']} "
+            f"backburner={'on' if state['front'] else 'off'} "
+            f"pilot={'cpi' if state['pilot_cpi'] else 'ipi'} status={status}")
 
 
 def main():
-    global QUIET, POST_DELAY_S
+    global VERBOSE, POST_DELAY_S
     args = parse_args()
 
     if args.status:
         show_status()
         return
 
-    QUIET = args.fast
-    POST_DELAY_S = 0.2 if args.fast else 1.0
+    VERBOSE = args.verbose
+    POST_DELAY_S = 1.0 if args.verbose else 0.2
 
     if os.geteuid() != 0:
-        log("Not running as root - re-executing under sudo...")
+        print("Not running as root - re-executing under sudo...")
         os.execvp("sudo", ["sudo", sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
 
     persisted = load_state()
