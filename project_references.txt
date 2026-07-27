@@ -1,3 +1,239 @@
 https://pypi.org/project/cc1101/
 https://github.com/johnellinwood/smartfire
 https://github.com/j2deen/proflame2-esp/
+
+
+---- CURRENT PROJECT STATE ----
+# WiFirePi Fireplace Bridge — Project Summary
+
+**Purpose:** Custom Raspberry Pi + CC1101 hardware bridge to control a SIT Proflame 2
+gas fireplace insert over 315MHz OOK, replacing/augmenting the stock remote, with
+a Flask API to eventually follow. This doc is a checkpoint summary meant to be
+pulled into a fresh conversation thread to cut down on token usage.
+
+---
+
+## Hardware
+
+- Custom interposer board: Raspberry Pi + CC1101 module, MCP1727 LDO for the
+  radio rail (gated by `RAD_EN`/GPIO27, `PWRGD`/GPIO22), NeoPixel status LED
+  (GPIO18), SPI0 hardware CE0 (GPIO8) for CC1101 chip select.
+- CC1101 antenna: originally a stock ~2" stub (undersized for 315MHz, likely
+  mistuned/433MHz-tuned), replaced with a proper 315MHz 3dBi RP-SMA antenna
+  (~4.19"). Fixed a real range/reliability problem.
+- **Current physical location: desk, ~17ft from the fireplace, plastic
+  enclosure, antenna external.** This location transmits reliably. Earlier
+  testing directly on/near the stone hearth (~1ft from the unit) was flaky —
+  likely receiver near-field/desense issues from being too close, not a
+  protocol or antenna-tuning problem. Do not re-locate the Pi close to the
+  fireplace without expecting reliability to degrade again.
+- Full pin map is documented in the docstring of `test_fireplace.py`.
+
+## Protocol (Proflame2 / SIT)
+
+- 314.973 MHz, OOK/ASK, 2400 baud, Manchester variant (0→01, 1→10, Z-pad→00,
+  sync→11). Packet = 7 words × 13 bits (91 bits decoded / 182 bits encoded).
+  Word = S + guard(1) + 8 data bits + pad + parity + end-guard(1). Pad=1 only
+  on word 1 (Serial 1). Burst = packet repeated 5× separated by 12 zero bits.
+- Word order: Serial1, Serial2, Serial3 (24-bit device serial, cloned from the
+  real remote — required to be accepted by the paired receiver), Command1
+  (pilot/light/thermostat/power), Command2 (front/fan/aux/flame), Error1
+  (checksum of Command1), Error2 (checksum of Command2).
+- **This device's verified serial number:** `0xA3D502`
+- **This device's verified checksum constants:** `C1=0x7, D1=0x5, C2=0x4, D2=0xD`
+  — cross-validated against two independent real captures with different
+  command values (`Ohi`/power-high and `Aboff`/aux-off), both matched exactly.
+- Checksum formula (confirmed independently 3 ways: our own derivation, the
+  `rtl_433` community thread, and the `proflame2-esp` source):
+  ```
+  h, l = high/low nibble of command byte
+  X = (C ^ (h<<1) ^ h ^ (l<<1)) & 0xF   # error high nibble
+  Y = (D ^ h ^ l) & 0xF                  # error low nibble
+  ```
+- Reference implementations consulted (all three independently agree on the
+  bit-level structure above):
+  - https://github.com/johnellinwood/smartfire — original spec, rfcat/YardStick-based
+  - https://github.com/j2deen/proflame2-esp — CC1101-native (ESP32), source of
+    the verified register table our driver is ported from
+  - `rtl_433`'s built-in decoder, `src/devices/proflame2.c` (protocol `-R 207`)
+    — confirms bit layout exactly, no additional semantic info on `front`/`aux`
+
+### Field semantics — **IMPORTANT, unit-specific findings**
+
+- `power`: **absolute state, NOT a toggle.** Confirmed via real-world captures
+  in the `rtl_433` community thread — the remote holds `power=1` steady across
+  many flame-level changes in the same session. An earlier working theory that
+  it was edge-triggered was wrong and has been retracted.
+- `flame=0` while `power=1` is very likely a **valid no-op** ("no target
+  flame requested"), not an error — no real-world capture from any source
+  ever shows `Power:1` paired with `Flame:0`. **`test_fireplace.py` now hard
+  -blocks this combination** (`--flame` required and must be 1-6 when
+  `--power on`).
+- `pilot_cpi` (CPI/IPI): a **separate, deliberately user-controlled seasonal
+  setting** (CPI = pilot lit, faster ignition + anti-condensation in winter;
+  IPI = pilot off). **Must never be silently changed by a power/flame/etc.
+  command.** This is now handled correctly — it's part of the persisted state
+  and only changes when `--pilot-cpi` is explicitly passed.
+- `front` (protocol name) — **CONFIRMED via direct hardware testing (2026-07-24)
+  that on THIS unit it controls the rear/back-row burner**, not anything
+  front-facing. This is unit-specific wiring, not a universal Proflame2
+  meaning — other installations may differ. Exposed to the user as
+  `--backburner` in the CLI (the library/protocol layer still calls it
+  `front` internally — intentional, keeps consistency with the spec and all
+  reference implementations; only the human-facing name changed).
+- `aux` (Command2 bit 3) — tested extensively (`--aux on`/`off`, repeated),
+  **confirmed no observable effect on this unit.** Software encoding was
+  independently verified correct (bit does flip in the actual transmitted
+  byte) — this is a hardware/wiring limitation of this specific fireplace,
+  not a bug. **Removed from the CLI entirely** per user decision; the
+  `FireplaceState` dataclass still has the field (defaults to `False`,
+  never set) for protocol completeness.
+- `light` and `fan` — the official Flare Fireplaces / SIT installation manual
+  documents these as **"(not used)"** on at least one product line sharing
+  this same protocol. Not confirmed either way for this specific unit yet —
+  worth keeping in mind if either seems to have no effect; may be a hardware
+  limitation rather than a bug, same pattern as `aux`.
+
+---
+
+## Current file inventory
+
+All files live in `~/projects/wifire/` on the Pi.
+
+| File | Purpose |
+|---|---|
+| `proflame2_protocol.py` | Pure protocol logic — no hardware deps. Builds packets from a `FireplaceState`, computes checksums, Manchester-encodes, assembles the 5x-repeat burst. Self-test on `python3 proflame2_protocol.py` reproduces two independently-verified real captures bit-for-bit. |
+| `cc1101_tx.py` | CC1101 SPI/GPIO driver. TX only (no RX yet). Register table + TX approach ported directly from `proflame2-esp`'s verified C++ source (fixed-length packet mode, manual calibration, tight-poll FIFO refill) — not reconstructed from generic examples. Handles `RAD_EN`/`PWRGD` power sequencing. |
+| `test_fireplace.py` | **Active, current script.** CLI: `--power {on,off}` (required unless `--status`), `--flame/--fan/--light 0-6`, `--backburner {on,off}`, `--pilot-cpi {cpi,ipi}`, `--fast` (quiet + faster), `--status` (print last-known state, no hardware/root needed). Tracks state persistently in `fireplace_state.json` — unspecified fields carry forward from the last run instead of resetting to 0/off, because the real remote always transmits full state, not deltas. NeoPixel status: yellow=attempting power-on, blue=radio powered/ready, green=confirmed radio off, red=failure. |
+| `test_power_on.py` | **Frozen/legacy.** Earlier version, kept as-is per explicit instruction. Do not edit further; all active work happens in `test_fireplace.py`. |
+| `run_fireplace_tests.sh` | Randomized batch test harness. **STALE** — was written before the state-carry-forward redesign and the `--aux`→removed / `--front`→`--backburner` rename. It still constructs old-style flags. Needs an update before next use. |
+| `fireplace_state.json` | Persisted state (git-ignore this — it's runtime data, not source). May contain a stale `aux` key from before the rename; both `test_fireplace.py` and `--status` handle that gracefully (drop/flag it, don't error). |
+| `cc1101test.py` | Early bring-up/diagnostic script (SPI register read sanity check, LDO off/on/off PWRGD sequence test). Still useful as a standalone hardware sanity check, separate from the main app. |
+
+**Dependency shape:** `test_fireplace.py` imports from *both* `proflame2_protocol.py`
+(what to send) and `cc1101_tx.py` (how to send it). The two library modules do
+**not** import each other or know about each other — deliberate separation
+(protocol logic is hardware-independent and fully unit-testable without a Pi;
+the radio driver is protocol-independent and could transmit any OOK payload).
+
+---
+
+## What's verified/working
+
+- SPI communication with the CC1101 confirmed correct (`PARTNUM`/`VERSION`
+  register reads, burst-read header bytes).
+- LDO power sequencing (`RAD_EN`/`PWRGD`) verified reliable with a 250ms
+  settle time.
+- CC1101 TX confirmed **bit-perfect** against real captured bursts (rigorous
+  cross-repeat-agreement decode method, 1.000 agreement score, byte-for-byte
+  match to intended encoding) — this took real debugging (infinite-length
+  packet mode → fixed-length mode + manual calibration rewrite, ported from
+  `proflame2-esp`'s verified register table).
+- End-to-end real-world confirmation: fireplace has audibly Roger-Beeped and
+  physically changed state (relay/valve cycling) in response to our
+  transmitted commands, from the current desk location.
+- Serial number and checksum constants double-validated against two
+  independent real captures with different command content.
+- `--backburner` (rear burner) confirmed working via direct testing.
+
+## Outstanding / open items
+
+1. **`run_fireplace_tests.sh` needs updating** to match the current
+   `test_fireplace.py` CLI (state-carry-forward behavior, `--backburner`
+   instead of `--aux`/`--front`, `--status`). Not yet done.
+2. **`light` and `fan` fields untested for real-world effect on this unit** —
+   worth a deliberate isolated test given the "(not used)" precedent found in
+   official docs for a related product line.
+3. **No RTL-SDR currently available** (lost/misplaced) — this has been worked
+   around via Flipper Zero captures + from-scratch decode tooling, but a
+   working `rtl_433 -R 207` setup would make future debugging much faster and
+   give live ground-truth instead of manual `.sub` decoding.
+4. **Git: nothing in this project is committed yet.** Given a prior incident
+   this session where a version of `test_power_on.py` with local
+   uncommitted changes was accidentally overwritten and lost (no memory of
+   file contents persists between assistant turns/sessions — this is a hard
+   platform limitation, not a one-off mistake to just "be more careful"
+   about), getting `proflame2_protocol.py`, `cc1101_tx.py`,
+   `test_fireplace.py`, and `run_fireplace_tests.sh` into version control
+   is a real priority, not a nice-to-have.
+5. **Flask API integration** — the original stated goal (`smartfire`-style
+   `fp.power = True` REST interface) hasn't been started yet. Everything so
+   far has been CLI-driven bring-up/testing.
+6. **RX subsystem** — see below. Design-stage only, not built.
+
+---
+
+## RX subsystem — design discussion (not yet built)
+
+**Motivation:** Right now `test_fireplace.py`'s persisted state only reflects
+commands *we* sent — it has zero visibility into changes made with the
+physical remote. A working RX listener would let the Pi passively observe
+real remote transmissions and keep `fireplace_state.json` genuinely accurate
+instead of "our best guess based on what we last commanded."
+
+**Yes, the CC1101 can receive** — it's a full transceiver; `cc1101_tx.py`
+only configured TX registers because that's all the project has needed so far.
+
+**Why RX is a meaningfully different problem than TX, not just a flag flip:**
+
+Our TX configuration deliberately does **not** use the CC1101's hardware
+sync-word feature (`MDMCFG2.SYNC_MODE = 000`, none) — the protocol's "S" sync
+symbols are purely a software-level Manchester-encoding construct, invisible
+to the chip's packet engine. For TX this doesn't matter (we just stream
+pre-built bytes into the FIFO). For RX it matters a lot, because without
+hardware sync detection, the chip has no way to know where a packet starts.
+
+**Option A — async serial / bit-banging (the "obvious" approach, has a real risk):**
+Configure `GDO0` to output the raw demodulated OOK bitstream in real time, and
+have the Pi timestamp edges in software — essentially reimplementing what the
+Flipper's "Read RAW" does, but continuously and live. Risk: Python on a
+non-realtime OS doing GPIO edge-timestamping at 2400 baud (~416µs/bit) is
+right at the edge of reliably accurate. Under any system load, bits can be
+missed or misread — the same *class* of timing problem that was chased and
+fixed on the TX side (FIFO underrun/glitch debugging), but arguably harder
+here since it's continuous rather than a single bounded transmission.
+
+**Option B — hardware sync-word matching (preferred approach):**
+Since this device's remote has a known, fixed 24-bit serial number
+(`0xA3D502`), we can compute the exact raw Manchester chip pattern its
+Serial1/Serial2 words produce and load that directly into the CC1101's real
+`SYNC1`/`SYNC0` hardware registers. This lets the chip's own packet engine do
+genuine hardware-timed sync detection — triggering only on *our specific
+paired remote's* actual signal — then read a fixed-length payload out of the
+RX FIFO the same way TX already reads/writes the TX FIFO (a problem this
+project has already solved reliably). This avoids the bit-banging jitter
+problem entirely and produces a real hardware-timed receiver rather than a
+software approximation of one.
+
+**Proposed shape (not started):**
+- New module, not a bolt-on to `test_fireplace.py` — RX is architecturally a
+  background/long-running concern (likely a small systemd-managed service),
+  distinct from the one-shot command-and-exit shape of the current script.
+- Decodes incoming remote transmissions using the same
+  `proflame2_protocol.py` logic already built and validated (parity checks,
+  checksum verification) as a sanity/integrity gate before trusting a
+  decoded packet.
+- On a valid decode, updates `fireplace_state.json` (the same file
+  `test_fireplace.py` already reads/writes) — meaning TX and RX would
+  share one source of truth for "current known state" going forward.
+- Open question not yet resolved: how to reconcile a state file being
+  written by two different processes (the one-shot TX script vs. a
+  long-running RX daemon) — likely needs at least a file lock or a move to
+  a small local IPC/socket instead of raw JSON-file read-modify-write,
+  worth designing deliberately rather than bolting on later.
+
+---
+
+## Useful context for a fresh thread
+
+- Reference repos already reviewed in depth: `johnellinwood/smartfire`,
+  `j2deen/proflame2-esp` (both `.h`/`.cpp` reviewed directly), `merbanan/rtl_433`
+  (`src/devices/proflame2.c` reviewed directly).
+- Official documentation reviewed: Flare Fireplaces SIT Proflame 2 installation
+  manual, SIT Proflame 2 Basic/Standard/Complete remote control manual, an
+  SIT technical/service manual (enviro.com) describing manual-override wiring.
+- If picking this up in a new thread: the most useful things to re-establish
+  quickly are (1) the verified serial number + checksum constants above, (2)
+  the field-semantics table above (especially `--backburner` vs `aux`), and
+  (3) that RF reliability is location-dependent — desk location works, near
+  the hearth does not.
