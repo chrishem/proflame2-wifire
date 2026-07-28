@@ -2,3 +2,4 @@
 smartfire/
 __pycache__/
 fireplace_state.json
+fpctrl.env
