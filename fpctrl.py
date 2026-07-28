@@ -201,11 +201,14 @@ def np_error():
 
 def publish_mqtt_state(client, state):
     payload = json.dumps(state)
-    info = client.publish(MQTT_STATE_TOPIC, payload, qos=1, retain=True)
-    try:
-        info.wait_for_publish(timeout=5)
-    except Exception as e:
-        log.warning(f"MQTT state publish did not confirm: {e}")
+    # Deliberately NOT calling wait_for_publish() here: this function runs
+    # inside on_message(), which executes on the same thread loop_forever()
+    # uses to pump the network loop. Blocking here for a PUBACK would block
+    # the very loop that processes that PUBACK - a self-deadlock that (before
+    # this fix) silently ate the full 5s timeout on every single publish.
+    # QoS 1 already gives delivery guarantees at the protocol level; we don't
+    # need a synchronous confirmation on top of it.
+    client.publish(MQTT_STATE_TOPIC, payload, qos=1, retain=True)
     log.info(f"Published state to {MQTT_STATE_TOPIC}: {payload}")
 
 
