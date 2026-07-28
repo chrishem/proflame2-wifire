@@ -1,97 +1,107 @@
 #!/usr/bin/env python3
 """
-fpctrl - Send a Proflame2 command to the fireplace, tracking persisted state
-between runs so unspecified fields carry forward instead of resetting to
-0/False.
+fpctrl - Proflame2 fireplace MQTT-driven daemon.
 
-The real remote always transmits its FULL current state, not deltas - so we
-have to do the same. Any field you don't pass on the command line is read
-from the last-known state (fireplace_state.json, next to this script) rather
-than defaulting to 0/off, which would otherwise silently stomp on settings
-you didn't intend to change.
+Long-running service, not a CLI tool. Subscribes to MQTT topic
+'fireplace/set' for inbound commands and applies them via the CC1101,
+persists the resulting state to fireplace_state.json, and publishes to
+'fireplace/state' (retained) whenever the state actually changes. There is
+intentionally no command-line control mode - if a CLI is wanted later, it
+should be a separate thin tool that just publishes to 'fireplace/set'.
 
-Usage:
-  sudo ./fpctrl.py --power on --flame 3 --fan 2 --light 1 --backburner on
-  sudo ./fpctrl.py --power on --backburner on   (carries over flame/fan/light/
-                                               pilot from last run)
-  sudo ./fpctrl.py --power off
-  sudo ./fpctrl.py --power off --pilot cpi  (pilot mode can ONLY be changed
-                                               together with --power off)
-  ./fpctrl.py --power on --flame 1              (quiet + fast by default)
-  ./fpctrl.py --power on --flame 1 --verbose    (full step-by-step output, slower
-                                               cosmetic delays for visual watching)
-  ./fpctrl.py --status                          (no root needed - prints last-known state)
+Command payload (any subset of these keys; omitted keys carry forward from
+the last-known state, same principle as before - the real remote always
+transmits its full state, so we have to too):
 
-First run ever (no state file yet): all unspecified fields default to a
-conservative 0/off baseline, and the script prints a clear warning that this
-is an ASSUMED starting point, not a confirmed reading - there's no way to
-electronically verify the fireplace's real current state.
+  {"power": "on"|"off"|true|false,
+   "flame": 0-6,
+   "fan": 0-6,
+   "light": 0-6,
+   "backburner": "on"|"off"|true|false,
+   "pilot": "cpi"|"ipi"}
 
-Exit codes:
-  0 = success
-  1 = radio LDO power-on failed (PWRGD never went high)
-  2 = CC1101 configure/transmit failure
+A payload containing a "status" key (any value) is a read-only request:
+current state is published to 'fireplace/state' immediately, any other
+fields in the same payload are ignored, and no radio/hardware access
+happens. E.g. {"status": true}.
 
-Always prints one final machine-parseable line:
-  RESULT: power=on flame=3 fan=2 light=0 backburner=off pilot=ipi status=ok
-  RESULT: power=on flame=3 fan=2 light=0 backburner=off pilot=ipi status=error:<message>
+Validation rules (unchanged from the CLI version, now enforced against the
+RESULTING merged state rather than just what's in a single payload):
+  - flame must be 1-6 whenever the resulting power state is on (0 means "no
+    target flame" - a correctly-executed no-op, blocked rather than sent).
+  - pilot can only change when the resulting power state is off (the
+    fireplace must be off to switch CPI/IPI - confirmed by the user, not
+    just a software guess).
+
+NeoPixel status is delegated entirely to npdaemon over its Unix domain
+socket (/run/npdaemon/npdaemon.sock) - this process does not touch
+rpi_ws281x/DMA/GPIO18 directly, and does NOT need root as a result. It does
+need:
+  - membership in the `spi` group (for /dev/spidev0.0)
+  - membership in the `gpio` group (for RAD_EN/PWRGD via RPi.GPIO)
+  - to run as the same user npdaemon's socket is chowned to (currently
+    `tech`, per npdaemon's own design doc)
+Check with `groups $USER`; add with `sudo usermod -aG spi,gpio <user>`
+(requires a fresh login / service restart to take effect).
+
+Failsafe: while the fireplace is on, an auto-shutoff timer is armed for
+FIREPLACE_MAX_ON_MINUTES (fpctrl.env, default 60). ANY command received
+while already on resets/extends this timer - same principle as a hot tub's
+"jets running" session limit, but session-extending rather than a hard cap:
+the fireplace can never be left on with no active supervising process, but
+normal use (adjusting flame/fan) doesn't cut a session artificially short.
+Set FIREPLACE_MAX_ON_MINUTES=0 to explicitly disable (not the default -
+this is a safety feature, not something to silently opt out of).
+
+MQTT_HOST in fpctrl.env is REQUIRED for this daemon (unlike the old
+publish-only usage where it was optional) - it's the only control input.
+Missing config is a fatal startup error, not a silent skip.
 
 Pin map (per WiFirePi interposer board):
   RAD_EN (LDO enable, "LDOCTRL")  GPIO27
   PWRGD  (LDO power-good)          GPIO22
-  NeoPixel data                    GPIO18
-  CC1101 GDO-0                     GPIO5   (not used by this script - reserved
-                                             for future RX/status monitoring)
-  CC1101 GDO-2                     GPIO6   (not used by this script - reserved)
-  CC1101 CHIPSEL                   GPIO8   (hardware SPI0 CE0 - handled
-                                             automatically by spidev.open(0, 0))
-  Pi power button                  GPIO17  (not used by this script)
-  Misc spare                       GPIO23  (not used by this script)
-
-Requires root (rpi_ws281x needs /dev/mem access for DMA/PWM) - the script
-re-execs itself under sudo automatically if not already root (--status
-excepted, which needs no hardware access at all).
+  CC1101 CHIPSEL                   GPIO8   (hardware SPI0 CE0)
+  NeoPixel data                    GPIO18  (owned by npdaemon, not this process)
 """
 
-import argparse
 import json
+import logging
 import os
+import signal
+import socket as socketlib
 import sys
+import threading
 import time
 
 import RPi.GPIO as GPIO
-from rpi_ws281x import PixelStrip, Color
 
 from proflame2_protocol import FireplaceState, ChecksumConstants, build_burst_bits, bits_to_bytes
 from cc1101_tx import CC1101TX
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("fpctrl")
+
 RAD_EN = 27
 PWRGD = 22
-
-LED_PIN = 18
-LED_COUNT = 1
-LED_FREQ_HZ = 800000
-LED_DMA = 10
-LED_BRIGHTNESS = 80
-LED_INVERT = False
-LED_CHANNEL = 0
-
-COLOR_OFF = Color(0, 0, 0)
-COLOR_RED = Color(255, 0, 0)
-COLOR_YELLOW = Color(255, 180, 0)
-COLOR_BLUE = Color(0, 0, 255)
-COLOR_GREEN = Color(0, 255, 0)
 
 SERIAL_NUMBER = 0xA3D502
 CHECKSUM = ChecksumConstants(c1=0x7, d1=0x5, c2=0x4, d2=0xD)
 
-LDO_SETTLE_S = 0.25  # MCP1727 startup is well under this; generous margin
+LDO_SETTLE_S = 0.25
 
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fireplace_state.json")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(SCRIPT_DIR, "fireplace_state.json")
+ENV_FILE = os.path.join(SCRIPT_DIR, "fpctrl.env")
 
-# Conservative assumed baseline ONLY used if no state file exists yet.
-# This is a guess, not a confirmed reading - there's no way to electronically
-# verify the fireplace's actual current state.
+MQTT_STATE_TOPIC = "fireplace/state"
+MQTT_COMMAND_TOPIC = "fireplace/set"
+
+NPDAEMON_SOCK = "/run/npdaemon/npdaemon.sock"
+
 DEFAULT_STATE = {
     "power": False,
     "pilot_cpi": False,
@@ -101,25 +111,36 @@ DEFAULT_STATE = {
     "front": False,
 }
 
-VERBOSE = False       # set from --verbose/--debug in main(); default is quiet+fast
-POST_DELAY_S = 0.2    # 1.0s under --verbose, for visual NeoPixel watching
+command_lock = threading.Lock()
+_failsafe_timer = None
+_failsafe_timer_lock = threading.Lock()
+
+_shutdown_event = threading.Event()
 
 
-def log(msg):
-    """Routine step-tracing - only shown with --verbose/--debug. Notices,
-    warnings, and errors bypass this and always print."""
-    if VERBOSE:
-        print(msg)
+# --- env / state file helpers ---
+
+def load_env(path=ENV_FILE):
+    env = {}
+    if not os.path.exists(path):
+        return env
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            env[key.strip()] = value.strip().strip('"').strip("'")
+    return env
 
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
             return json.load(f)
-    print(f"NOTE: no state file found at {STATE_FILE} - this is the first run, "
-          f"or it was deleted. Assuming baseline (power off, everything 0/off). "
-          f"This is a GUESS, not a confirmed reading - verify against the real "
-          f"fireplace if this matters.")
+    log.info(f"No state file at {STATE_FILE} - starting from baseline "
+             f"(power off, everything 0/off). This is a guess, not a "
+             f"confirmed reading of the real fireplace.")
     return dict(DEFAULT_STATE)
 
 
@@ -128,191 +149,170 @@ def save_state(state):
         json.dump(state, f, indent=2)
 
 
-def set_pixel(strip, color):
-    for i in range(strip.numPixels()):
-        strip.setPixelColor(i, color)
-    strip.show()
+def canonical(state):
+    """Reduce to just the fields we track, so stale keys (aux, thermostat
+    from older versions) never trigger a false 'state changed' positive."""
+    return {k: state.get(k) for k in DEFAULT_STATE}
 
 
-def set_radio_ldo(strip: PixelStrip, turn_on: bool) -> bool:
-    """Set the LDO on/off, wait for it to settle, verify via PWRGD, and reflect
-    status on the NeoPixel.
+# --- npdaemon NeoPixel client (fire-and-forget, never raises) ---
 
-    For turn_on=True: a PWRGD failure is fatal (nothing downstream can work
-    without power) - NeoPixel goes red and the script exits with code 1.
-    For turn_on=False: a PWRGD mismatch is a warning, not fatal - there's
-    nothing left to protect by aborting during cleanup, so it just returns
-    False and lets the caller continue.
-    """
-    if turn_on:
-        set_pixel(strip, COLOR_YELLOW)
-        GPIO.output(RAD_EN, GPIO.HIGH)
-    else:
-        GPIO.output(RAD_EN, GPIO.LOW)
-
-    time.sleep(LDO_SETTLE_S)
-    pwrgd = GPIO.input(PWRGD)
-
-    if turn_on:
-        if not pwrgd:
-            print("ERROR: PWRGD is LOW - LDO did not come up.", file=sys.stderr)
-            set_pixel(strip, COLOR_RED)
-            GPIO.output(RAD_EN, GPIO.LOW)
-            sys.exit(1)
-        log("PWRGD confirmed high.")
-        set_pixel(strip, COLOR_BLUE)
-        return True
-    else:
-        if pwrgd:
-            print("WARNING: PWRGD still HIGH after LDO off - rail may not have "
-                  "discharged yet, or PWRGD/RAD_EN wiring should be re-checked.",
-                  file=sys.stderr)
-            return False
-        log("PWRGD confirmed low - LDO cleanly disabled.")
-        set_pixel(strip, COLOR_GREEN)
-        return True
+IDLE_COLOR = [0, 0, 60]
+IDLE_BRIGHTNESS = 40
 
 
-def render_range(value, max_value=6):
-    """Render a 0-max_value setting as a visual range, e.g. '0 1 [2] 3 4 5 6'.
-    Doubles as a preview of what a small physical display could show later."""
-    digits = [f"[{i}]" if i == value else str(i) for i in range(max_value + 1)]
-    return f"{value} of {max_value}   " + " ".join(digits)
+def np_send(payload: dict):
+    try:
+        with socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.connect(NPDAEMON_SOCK)
+            s.sendall(json.dumps(payload).encode() + b"\n")
+    except Exception as e:
+        log.warning(f"npdaemon unreachable ({e}) - NeoPixel status not updated")
 
 
-def show_status():
-    persisted = load_state()
-    print("Last known fireplace state (from persisted state file - this reflects "
-          "what we last COMMANDED, NOT a live/confirmed reading - no receiver "
-          "hardware exists to verify this against the real fireplace):")
-    print(f"  power:      {'on' if persisted.get('power') else 'off'}")
-    print(f"  flame:      {render_range(persisted.get('flame', 0))}")
-    print(f"  fan:        {render_range(persisted.get('fan', 0))}")
-    print(f"  light:      {render_range(persisted.get('light', 0))}")
-    print(f"  backburner: {'on' if persisted.get('front') else 'off'}")
-    print(f"  pilot:      {'cpi' if persisted.get('pilot_cpi') else 'ipi'}")
-    if "aux" in persisted:
-        print("  (stale 'aux' field present in state file - no longer used, "
-              "will be dropped automatically on next command)")
-    if "thermostat" in persisted:
-        print("  (stale 'thermostat' field present in state file - not used, "
-              "will be dropped automatically on next command)")
+def np_idle():
+    np_send({"effect": "solid", "color": IDLE_COLOR, "brightness": IDLE_BRIGHTNESS})
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Send a Proflame2 command to the fireplace.")
-    parser.add_argument("--power", choices=["on", "off"], default=None,
-                         help="Fireplace power state to request. Required unless --status.")
-    parser.add_argument("--flame", type=int, default=None, choices=range(0, 7), metavar="0-6",
-                         help="Flame height (0-6). Must be 1-6 when --power on - 0 "
-                              "means 'no target flame', a correctly-executed no-op "
-                              "that looks like the fireplace ignoring the command. "
-                              "Defaults to 0 for --power off, where it's moot.")
-    parser.add_argument("--fan", type=int, default=None, choices=range(0, 7), metavar="0-6",
-                         help="Fan speed (0-6). If omitted, carries forward from last run.")
-    parser.add_argument("--light", type=int, default=None, choices=range(0, 7), metavar="0-6",
-                         help="Light level (0-6). If omitted, carries forward from last run. "
-                              "NOTE: at least one related product line's official manual lists "
-                              "this as 'not used' - may have no effect on this unit; unconfirmed.")
-    parser.add_argument("--backburner", choices=["on", "off"], default=None,
-                         help="Rear/secondary burner (library-internally this is the "
-                              "protocol's 'front' bit - confirmed 2026-07-24 that on "
-                              "this unit it controls the rear burner, not anything "
-                              "front-facing). If omitted, carries forward from last run.")
-    parser.add_argument("--pilot", choices=["cpi", "ipi"], default=None,
-                         help="Pilot mode: cpi=Continuous Pilot Ignition (pilot "
-                              "stays lit), ipi=Intermittent Pilot Ignition (pilot "
-                              "only lights on demand). This is a deliberate, "
-                              "separate seasonal setting - NOT tied to power on/off, "
-                              "and can ONLY be changed together with --power off "
-                              "(the fireplace must be off to switch pilot mode). If "
-                              "omitted, carries forward from last run (never "
-                              "silently changed).")
-    parser.add_argument("--status", action="store_true",
-                         help="Print the last-known fireplace state and exit - no "
-                              "radio, no LDO, no root needed. This reads the "
-                              "persisted state file, which reflects what we last "
-                              "COMMANDED, not a live/confirmed reading (no receiver "
-                              "hardware exists to verify the fireplace's real state).")
-    parser.add_argument("--verbose", "--debug", action="store_true", dest="verbose",
-                         help="Show full step-by-step output and use slower cosmetic "
-                              "delays (for watching the NeoPixel by eye). Default is "
-                              "quiet + fast (only the final RESULT line and any "
-                              "errors/warnings print).")
-    args = parser.parse_args()
-
-    if args.status:
-        return args  # --power etc. not required/validated in status mode
-
-    if args.power is None:
-        parser.error("--power is required unless --status is given")
-
-    if args.power == "on" and (args.flame is None or args.flame == 0):
-        parser.error("--flame must be 1-6 when --power on (0 means 'no target "
-                      "flame' - a correctly-executed no-op that looks like the "
-                      "fireplace ignoring the command)")
-    if args.flame is None:
-        args.flame = 0  # fine for --power off; visible flame level is moot
-
-    if args.pilot is not None and args.power != "off":
-        parser.error("--pilot can only be changed together with --power off "
-                      "(pilot mode cannot be switched while the fireplace is on)")
-
-    return args
+def np_processing():
+    np_send({"effect": "solid", "color": [255, 180, 0], "brightness": 120, "override": True})
 
 
-def merge_state(persisted, args):
-    """Overlay explicitly-provided CLI args onto the persisted state. Fields
-    not passed on the command line keep their last-known value."""
+def np_success():
+    np_send({"effect": "pulse", "color": [0, 255, 0], "brightness": 120,
+              "speed": 2.0, "duration": 1.5, "override": True})
+    np_send({"effect": "solid", "color": IDLE_COLOR, "brightness": IDLE_BRIGHTNESS})  # queues behind pulse
+
+
+def np_failsafe():
+    np_send({"effect": "pulse", "color": [255, 140, 0], "brightness": 150,
+              "speed": 2.0, "duration": 2.5, "override": True})
+    np_send({"effect": "solid", "color": IDLE_COLOR, "brightness": IDLE_BRIGHTNESS})
+
+
+def np_error():
+    np_send({"effect": "blink", "color": [255, 0, 0], "brightness": 150,
+              "interval": 0.2, "cycles": 6, "override": True})
+    np_send({"effect": "solid", "color": IDLE_COLOR, "brightness": IDLE_BRIGHTNESS})
+
+
+# --- MQTT state publish (retained, only on actual change) ---
+
+def publish_mqtt_state(client, state):
+    payload = json.dumps(state)
+    info = client.publish(MQTT_STATE_TOPIC, payload, qos=1, retain=True)
+    try:
+        info.wait_for_publish(timeout=5)
+    except Exception as e:
+        log.warning(f"MQTT state publish did not confirm: {e}")
+    log.info(f"Published state to {MQTT_STATE_TOPIC}: {payload}")
+
+
+# --- command validation / merge (MQTT JSON -> merged state dict) ---
+
+def _coerce_onoff(value, field_name):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ("on", "off"):
+        return value.lower() == "on"
+    raise ValueError(f"invalid {field_name} value: {value!r} (expected on/off or true/false)")
+
+
+def _coerce_range(value, field_name, lo=0, hi=6):
+    if isinstance(value, bool) or not isinstance(value, int) or not (lo <= value <= hi):
+        raise ValueError(f"invalid {field_name} value: {value!r} (expected int {lo}-{hi})")
+    return value
+
+
+def validate_and_merge(payload: dict, persisted: dict):
+    """Returns (merged_state, None) on success, or (None, error_message)."""
     merged = dict(persisted)
-    merged.pop("aux", None)  # retired - confirmed no observable effect on this unit
-    merged.pop("thermostat", None)  # retired - not used on this fireplace's remote
-    merged["power"] = (args.power == "on")
-    if args.flame is not None:
-        merged["flame"] = args.flame
-    if args.fan is not None:
-        merged["fan"] = args.fan
-    if args.light is not None:
-        merged["light"] = args.light
-    if args.backburner is not None:
-        # "backburner" is the user-facing name; the library field is still "front"
-        # (confirmed 2026-07-24 that's the bit that actually drives this on this unit)
-        merged["front"] = (args.backburner == "on")
-    if args.pilot is not None:
-        merged["pilot_cpi"] = (args.pilot == "cpi")
-    return merged
+    merged.pop("aux", None)
+    merged.pop("thermostat", None)
 
-
-def result_line(state, status):
-    return (f"RESULT: power={'on' if state['power'] else 'off'} "
-            f"flame={state['flame']} fan={state['fan']} light={state['light']} "
-            f"backburner={'on' if state['front'] else 'off'} "
-            f"pilot={'cpi' if state['pilot_cpi'] else 'ipi'} status={status}")
-
-
-def main():
-    global VERBOSE, POST_DELAY_S
-    args = parse_args()
-
-    if args.status:
-        show_status()
-        return
-
-    VERBOSE = args.verbose
-    POST_DELAY_S = 1.0 if args.verbose else 0.2
-
-    if os.geteuid() != 0:
-        print("Not running as root - re-executing under sudo...")
-        os.execvp("sudo", ["sudo", sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
-
-    persisted = load_state()
-    merged = merge_state(persisted, args)
+    try:
+        if "power" in payload:
+            merged["power"] = _coerce_onoff(payload["power"], "power")
+        if "flame" in payload:
+            merged["flame"] = _coerce_range(payload["flame"], "flame")
+        if "fan" in payload:
+            merged["fan"] = _coerce_range(payload["fan"], "fan")
+        if "light" in payload:
+            merged["light"] = _coerce_range(payload["light"], "light")
+        if "backburner" in payload:
+            merged["front"] = _coerce_onoff(payload["backburner"], "backburner")
+        if "pilot" in payload:
+            pilot_val = payload["pilot"]
+            if not (isinstance(pilot_val, str) and pilot_val.lower() in ("cpi", "ipi")):
+                raise ValueError(f"invalid pilot value: {pilot_val!r} (expected cpi/ipi)")
+            if merged["power"]:
+                raise ValueError("pilot mode can only be changed while power is off "
+                                  "(resulting power state is on)")
+            merged["pilot_cpi"] = (pilot_val.lower() == "cpi")
+    except ValueError as e:
+        return None, str(e)
 
     if merged["power"] and merged["flame"] == 0:
-        print("ERROR: resulting flame=0 with power=on (0 means 'no target flame', "
-              "a correctly-executed no-op). Pass --flame 1-6, or check the "
-              "carried-over state in " + STATE_FILE, file=sys.stderr)
-        sys.exit(2)
+        return None, ("resulting flame=0 with power=on (0 means 'no target "
+                       "flame' - a correctly-executed no-op, rejected instead "
+                       "of silently doing nothing)")
+
+    return merged, None
+
+
+# --- failsafe timer ---
+
+def get_max_on_minutes():
+    env = load_env()
+    raw = env.get("FIREPLACE_MAX_ON_MINUTES", "60")
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning(f"FIREPLACE_MAX_ON_MINUTES={raw!r} is not an integer, defaulting to 60")
+        return 60
+
+
+def cancel_failsafe():
+    global _failsafe_timer
+    with _failsafe_timer_lock:
+        if _failsafe_timer is not None:
+            _failsafe_timer.cancel()
+            _failsafe_timer = None
+
+
+def arm_failsafe():
+    global _failsafe_timer
+    minutes = get_max_on_minutes()
+    with _failsafe_timer_lock:
+        if _failsafe_timer is not None:
+            _failsafe_timer.cancel()
+            _failsafe_timer = None
+        if minutes <= 0:
+            log.info("Failsafe disabled (FIREPLACE_MAX_ON_MINUTES=0)")
+            return
+        _failsafe_timer = threading.Timer(minutes * 60, failsafe_fire)
+        _failsafe_timer.daemon = True
+        _failsafe_timer.start()
+        log.info(f"Failsafe (re)armed: auto-off in {minutes}m unless another command arrives first")
+
+
+def failsafe_fire():
+    log.warning("FAILSAFE: no command reset the timer within the configured window "
+                "while the fireplace was on - auto-shutting off")
+    with command_lock:
+        persisted = load_state()
+        merged = dict(persisted)
+        merged["power"] = False
+        apply_command(merged, mqtt_client, is_failsafe=True)
+
+
+# --- core apply path (shared by MQTT commands and the failsafe) ---
+
+def apply_command(merged, client, is_failsafe=False):
+    """Assumes command_lock is already held by the caller."""
+    persisted = load_state()
+    state_changed = canonical(persisted) != canonical(merged)
 
     state = FireplaceState(
         power=merged["power"],
@@ -323,62 +323,148 @@ def main():
         front=merged["front"],
     )
 
-    strip = PixelStrip(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA, LED_INVERT, LED_BRIGHTNESS, LED_CHANNEL)
-    strip.begin()
+    if not is_failsafe:
+        np_processing()
 
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-    GPIO.setup(RAD_EN, GPIO.OUT)
-    GPIO.setup(PWRGD, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    burst_bits = build_burst_bits(SERIAL_NUMBER, state, CHECKSUM)
+    payload = bits_to_bytes(burst_bits)
 
     radio = None
-
     try:
-        log("NeoPixel off, LDO off")
-        set_pixel(strip, COLOR_OFF)
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        GPIO.setup(RAD_EN, GPIO.OUT)
+        GPIO.setup(PWRGD, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+        GPIO.output(RAD_EN, GPIO.HIGH)
+        time.sleep(LDO_SETTLE_S)
+        if not GPIO.input(PWRGD):
+            raise RuntimeError("PWRGD is LOW - LDO did not come up")
+
+        radio = CC1101TX()
+        radio.configure_ook_tx()
+        radio.transmit(payload)
+
         GPIO.output(RAD_EN, GPIO.LOW)
-
-        log("Powering on...")
-        set_radio_ldo(strip, turn_on=True)  # exits(1) internally on PWRGD failure
-
-        log(f"Building and sending CC1101 command (carried-over fields marked "
-            f"with last-known value where not passed on CLI): {merged}")
-
-        burst_bits = build_burst_bits(SERIAL_NUMBER, state, CHECKSUM)
-        payload = bits_to_bytes(burst_bits)
-
-        try:
-            radio = CC1101TX()
-            info = radio.configure_ook_tx()
-            log(f"Configured: {info['actual_freq_hz']/1e6:.4f} MHz (PATABLE readback verified OK)")
-            radio.transmit(payload)
-            log("Transmit complete - FIFO drained cleanly, no underflow.")
-        except (RuntimeError, ValueError) as e:
-            print(f"ERROR: CC1101 transmit failed: {e}", file=sys.stderr)
-            set_pixel(strip, COLOR_RED)
-            print(result_line(merged, f"error:{e}"))
-            sys.exit(2)
-
-        set_pixel(strip, COLOR_OFF)
-        time.sleep(POST_DELAY_S)
-
-        log("Powering off...")
-        set_radio_ldo(strip, turn_on=False)
-
-        time.sleep(POST_DELAY_S)
-
-        set_pixel(strip, COLOR_OFF)
 
         save_state(merged)
-        log(f"State saved to {STATE_FILE}")
+        log.info(f"Applied command ({'FAILSAFE' if is_failsafe else 'MQTT'}): {merged}")
 
-        print(result_line(merged, "ok"))
+        if state_changed:
+            publish_mqtt_state(client, merged)
+        else:
+            log.info("State unchanged - not re-publishing.")
 
+        if is_failsafe:
+            np_failsafe()
+        else:
+            np_success()
+
+        if merged["power"]:
+            arm_failsafe()
+        else:
+            cancel_failsafe()
+
+    except Exception as e:
+        log.error(f"Command failed: {e}")
+        np_error()
+        GPIO.output(RAD_EN, GPIO.LOW)
     finally:
         if radio is not None:
-            radio.spi.close()  # avoid double GPIO.cleanup() via radio.close()
-        GPIO.output(RAD_EN, GPIO.LOW)
+            radio.spi.close()
         GPIO.cleanup()
+
+
+# --- MQTT wiring ---
+
+mqtt_client = None
+
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        log.info(f"Connected to MQTT broker, subscribing to {MQTT_COMMAND_TOPIC}")
+        client.subscribe(MQTT_COMMAND_TOPIC, qos=1)
+        np_idle()
+    else:
+        log.error(f"MQTT connect failed, rc={rc}")
+
+
+def on_disconnect(client, userdata, rc):
+    log.warning(f"MQTT disconnected (rc={rc}) - paho will attempt to reconnect")
+
+
+def on_message(client, userdata, msg):
+    try:
+        payload = json.loads(msg.payload.decode())
+    except Exception as e:
+        log.warning(f"Ignoring malformed payload on {msg.topic}: {e}")
+        np_error()
+        return
+    if not isinstance(payload, dict):
+        log.warning(f"Ignoring non-object payload on {msg.topic}: {payload!r}")
+        np_error()
+        return
+
+    if "status" in payload:
+        # Read-only request: report current state, ignore any other fields
+        # in the same payload, never touches the radio/hardware.
+        with command_lock:
+            persisted = load_state()
+            log.info(f"Status request received - publishing current state")
+            publish_mqtt_state(client, persisted)
+        return
+
+    with command_lock:
+        persisted = load_state()
+        merged, err = validate_and_merge(payload, persisted)
+        if err:
+            log.warning(f"Rejected command {payload}: {err}")
+            np_error()
+            return
+        apply_command(merged, client)
+
+
+def main():
+    global mqtt_client
+
+    import paho.mqtt.client as mqtt
+
+    env = load_env()
+    host = env.get("MQTT_HOST")
+    if not host:
+        log.critical(f"MQTT_HOST is not set in {ENV_FILE} - this daemon has no "
+                      f"control input without it. Exiting.")
+        sys.exit(1)
+    port = int(env.get("MQTT_PORT", "1883"))
+    username = env.get("MQTT_USERNAME")
+    password = env.get("MQTT_PASSWORD")
+    client_id = env.get("MQTT_CLIENT_ID", "fpctrl")
+
+    log.info(f"fpctrl starting - broker={host}:{port} "
+             f"command_topic={MQTT_COMMAND_TOPIC} state_topic={MQTT_STATE_TOPIC} "
+             f"failsafe={get_max_on_minutes()}m")
+
+    client = mqtt.Client(client_id=client_id)
+    if username:
+        client.username_pw_set(username, password)
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    mqtt_client = client
+
+    def handle_signal(signum, frame):
+        log.info(f"Received signal {signum}, shutting down...")
+        _shutdown_event.set()
+        cancel_failsafe()
+        client.disconnect()
+        GPIO.cleanup()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    client.connect(host, port, keepalive=30)
+    client.loop_forever(retry_first_connection=True)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,16 @@
 [Unit]
-Description=Fireplace Controller
-After=multi-user.target
-#Conflicts=getty@tty1.service
+Description=Proflame2 Fireplace MQTT Control Daemon
+After=network-online.target npdaemon.service
+Wants=network-online.target
 
 [Service]
+Type=simple
+User=tech
+Group=tech
 WorkingDirectory=/home/tech/projects/wifire
-ExecStart=/home/tech/projects/wifire/.venv/bin/gunicorn -k gthread --threads 4 -b 0.0.0.0:80 server:app
-#StandardInput=tty-force
+ExecStart=/home/tech/projects/wifire/.venv/bin/python /home/tech/projects/wifire/fpctrl.py
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
