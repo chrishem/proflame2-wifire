@@ -383,17 +383,17 @@ def apply_command(merged, client, is_failsafe=False):
 mqtt_client = None
 
 
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
+def on_connect(client, userdata, flags, reason_code, properties):
+    if reason_code == 0:
         log.info(f"Connected to MQTT broker, subscribing to {MQTT_COMMAND_TOPIC}")
         client.subscribe(MQTT_COMMAND_TOPIC, qos=1)
         np_idle()
     else:
-        log.error(f"MQTT connect failed, rc={rc}")
+        log.error(f"MQTT connect failed, rc={reason_code}")
 
 
-def on_disconnect(client, userdata, rc):
-    log.warning(f"MQTT disconnected (rc={rc}) - paho will attempt to reconnect")
+def on_disconnect(client, userdata, flags, reason_code, properties):
+    log.warning(f"MQTT disconnected (rc={reason_code}) - paho will attempt to reconnect")
 
 
 def on_message(client, userdata, msg):
@@ -431,6 +431,7 @@ def main():
     global mqtt_client
 
     import paho.mqtt.client as mqtt
+    from paho.mqtt.client import CallbackAPIVersion
 
     env = load_env()
     host = env.get("MQTT_HOST")
@@ -447,7 +448,7 @@ def main():
              f"command_topic={MQTT_COMMAND_TOPIC} state_topic={MQTT_STATE_TOPIC} "
              f"failsafe={get_max_on_minutes()}m")
 
-    client = mqtt.Client(client_id=client_id)
+    client = mqtt.Client(CallbackAPIVersion.VERSION2, client_id=client_id)
     if username:
         client.username_pw_set(username, password)
     client.on_connect = on_connect
