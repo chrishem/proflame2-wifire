@@ -37,7 +37,7 @@ pulled into a fresh conversation thread to cut down on token usage.
   on word 1 (Serial 1). Burst = packet repeated 5× separated by 12 zero bits.
 - Word order: Serial1, Serial2, Serial3 (24-bit device serial, cloned from the
   real remote — required to be accepted by the paired receiver), Command1
-  (pilot/light/thermostat/power), Command2 (front/fan/aux/flame), Error1
+  (pilot/light/thermostat/power), Command2 (backburner/fan/aux/flame), Error1
   (checksum of Command1), Error2 (checksum of Command2).
 - **This device's verified serial number:** `0xA3D502`
 - **This device's verified checksum constants:** `C1=0x7, D1=0x5, C2=0x4, D2=0xD`
@@ -56,7 +56,7 @@ pulled into a fresh conversation thread to cut down on token usage.
   - https://github.com/j2deen/proflame2-esp — CC1101-native (ESP32), source of
     the verified register table our driver is ported from
   - `rtl_433`'s built-in decoder, `src/devices/proflame2.c` (protocol `-R 207`)
-    — confirms bit layout exactly, no additional semantic info on `front`/`aux`
+    — confirms bit layout exactly, no additional semantic info on `backburner`/`aux`
 
 ### Field semantics — **IMPORTANT, unit-specific findings**
 
@@ -74,13 +74,11 @@ pulled into a fresh conversation thread to cut down on token usage.
   IPI = pilot off). **Must never be silently changed by a power/flame/etc.
   command.** This is now handled correctly — it's part of the persisted state
   and only changes when `--pilot-cpi` is explicitly passed.
-- `front` (protocol name) — **CONFIRMED via direct hardware testing (2026-07-24)
+- `backburner` (protocol name is "front") — **CONFIRMED via direct hardware testing (2026-07-24)
   that on THIS unit it controls the rear/back-row burner**, not anything
   front-facing. This is unit-specific wiring, not a universal Proflame2
   meaning — other installations may differ. Exposed to the user as
-  `--backburner` in the CLI (the library/protocol layer still calls it
-  `front` internally — intentional, keeps consistency with the spec and all
-  reference implementations; only the human-facing name changed).
+  `--backburner` in the CLI
 - `aux` (Command2 bit 3) — tested extensively (`--aux on`/`off`, repeated),
   **confirmed no observable effect on this unit.** Software encoding was
   independently verified correct (bit does flip in the actual transmitted
@@ -140,7 +138,7 @@ the radio driver is protocol-independent and could transmit any OOK payload).
 
 1. **`run_fireplace_tests.sh` needs updating** to match the current
    `test_fireplace.py` CLI (state-carry-forward behavior, `--backburner`
-   instead of `--aux`/`--front`, `--status`). Not yet done.
+   instead of `--aux`/`--backburner`, `--status`). Not yet done.
 2. **`light` and `fan` fields untested for real-world effect on this unit** —
    worth a deliberate isolated test given the "(not used)" precedent found in
    official docs for a related product line.

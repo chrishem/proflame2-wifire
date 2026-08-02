@@ -29,6 +29,8 @@ this device - see test vector at the bottom of this file):
 
   Command1 data byte (MSB first): pilot(1) | light(3) | 0 | 0 | thermostat(1) | power(1)
   Command2 data byte (MSB first): front(1) | fan(3) | aux(1) | flame(3)
+  Note: "front" is a generic term above; in my specific case, the burner
+        referred to by "front" is actually the BACK burner.
 
   Error1 = f(Command1, C1, D1); Error2 = f(Command2, C2, D2)
   where, with h/l = high/low nibble of the command byte:
@@ -88,7 +90,7 @@ class FireplaceState:
     pilot_cpi: bool = False       # True = CPI, False = IPI
     thermostat: bool = False
     light: int = 0                # 0-6
-    front: bool = False           # CONFIRMED via direct testing (2026-07-24): on THIS
+    backburner: bool = False       # CONFIRMED via direct testing (2026-07-24): on THIS
                                    # unit, this bit controls the back-row/secondary
                                    # burner - despite the protocol calling it "front".
                                    # This is unit-specific wiring, not a universal
@@ -112,7 +114,7 @@ class FireplaceState:
         assert 0 <= self.fan <= 6, "fan must be 0-6"
         assert 0 <= self.flame <= 6, "flame must be 0-6"
         return (
-            (1 if self.front else 0) << 7
+            (1 if self.backburner else 0) << 7
             | (self.fan & 0x7) << 4
             | (1 if self.aux else 0) << 3
             | (self.flame & 0x7)
@@ -175,10 +177,10 @@ if __name__ == "__main__":
     SERIAL = 0xA3D502
     CHECKSUM = ChecksumConstants(c1=0x7, d1=0x5, c2=0x4, d2=0xD)
 
-    # "Ohi" = Output Hi: power on, flame=6 (high), fan=4, front on, thermostat off, light=0
+    # "Ohi" = Output Hi: power on, flame=6 (high), fan=4, backburner on, thermostat off, light=0
     ohi_state = FireplaceState(
         power=True, pilot_cpi=True, thermostat=False, light=0,
-        front=True, fan=4, aux=False, flame=6,
+        backburner=True, fan=4, aux=False, flame=6,
     )
 
     expected = (

@@ -108,7 +108,7 @@ DEFAULT_STATE = {
     "flame": 0,
     "fan": 0,
     "light": 0,
-    "front": False,
+    "backburner": False,
 }
 
 command_lock = threading.Lock()
@@ -244,7 +244,7 @@ def validate_and_merge(payload: dict, persisted: dict):
         if "light" in payload:
             merged["light"] = _coerce_range(payload["light"], "light")
         if "backburner" in payload:
-            merged["front"] = _coerce_onoff(payload["backburner"], "backburner")
+            merged["backburner"] = _coerce_onoff(payload["backburner"], "backburner")
         if "pilot" in payload:
             pilot_val = payload["pilot"]
             if not (isinstance(pilot_val, str) and pilot_val.lower() in ("cpi", "ipi")):
@@ -323,7 +323,7 @@ def apply_command(merged, client, is_failsafe=False):
         flame=merged["flame"],
         fan=merged["fan"],
         light=merged["light"],
-        front=merged["front"],
+        backburner=merged["backburner"],
     )
 
     if not is_failsafe:

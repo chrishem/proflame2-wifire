@@ -110,8 +110,8 @@ table), and `rtl_433`'s built-in decoder (`src/devices/proflame2.c`).
 - **`backburner`** (user-facing name) - the protocol calls this bit `front`;
   confirmed via direct hardware testing that on this specific unit it
   drives the rear/back-row burner, not anything front-facing. Library code
-  keeps the protocol-accurate internal name (`FireplaceState.front`); only
-  the human-facing name differs.
+  uses the internal implementation name "backburner" instead of the protocol-
+  true "front".
 - `aux` (Command2 bit 3) - tested extensively, confirmed no observable
   effect on this unit. Removed from the CLI/MQTT schema entirely; the
   dataclass field still exists (always `False`) for protocol completeness.
