@@ -10,8 +10,15 @@ import time
 
 from smbus2 import SMBus, i2c_msg
 
-#AHT20_ADDR = 0x38
 
+def hex_or_int(x):
+    try:
+        val = int(x,0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"Invalid address: {x!r}")
+    if not (0x03 <= val <= 0x77):
+        raise argparse.ArgumentTypeError(f"Address {val:#x} out of valid I2C range")
+    return val
 
 def init_sensor(bus: SMBus, addr: int):
     write = i2c_msg.write(addr, [0xBE, 0x08, 0x00])
@@ -50,7 +57,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bus", type=int, default=1, help="I2C bus number (default 1)")
     parser.add_argument("--interval", type=float, default=0, help="Repeat every N seconds (default: read once and exit)")
-    parser.add_argument("--address", type=lambda x: int(x,0), default=0x38, help="I2C Address (eg 0x38 or 56)")
+    parser.add_argument("--address", type=hex_or_int, default=0x38, help="I2C Address (eg 0x38 or 56)")
     args = parser.parse_args()
 
     try:
