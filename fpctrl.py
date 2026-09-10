@@ -75,6 +75,8 @@ import time
 
 import RPi.GPIO as GPIO
 
+from device_config import RAD_EN, PWRGD, SERIAL_NUMBER, CHECKSUM_C1, CHECKSUM_D1, CHECKSUM_C2, CHECKSUM_D2
+
 from proflame2_protocol import FireplaceState, ChecksumConstants, build_burst_bits, bits_to_bytes
 from cc1101_tx import CC1101TX
 
@@ -85,11 +87,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("fpctrl")
 
-RAD_EN = 27
-PWRGD = 22
-
-SERIAL_NUMBER = 0xA3D502
-CHECKSUM = ChecksumConstants(c1=0x7, d1=0x5, c2=0x4, d2=0xD)
+CHECKSUM = ChecksumConstants(c1=CHECKSUM_C1, d1=CHECKSUM_D1, c2=CHECKSUM_C2, d2=CHECKSUM_D2)
 
 LDO_SETTLE_S = 0.25
 
@@ -109,6 +107,7 @@ DEFAULT_STATE = {
     "fan": 0,
     "light": 0,
     "backburner": False,
+    "thermostat": False,
 }
 
 command_lock = threading.Lock()
@@ -231,8 +230,7 @@ def _coerce_range(value, field_name, lo=0, hi=6):
 def validate_and_merge(payload: dict, persisted: dict):
     """Returns (merged_state, None) on success, or (None, error_message)."""
     merged = dict(persisted)
-    merged.pop("aux", None)
-    merged.pop("thermostat", None)
+    merged.setdefault("thermostat", False)
 
     try:
         if "power" in payload:
@@ -324,6 +322,7 @@ def apply_command(merged, client, is_failsafe=False):
         fan=merged["fan"],
         light=merged["light"],
         backburner=merged["backburner"],
+        thermostat=merged["thermostat"],
     )
 
     if not is_failsafe:
