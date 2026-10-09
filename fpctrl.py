@@ -390,6 +390,8 @@ def on_connect(client, userdata, flags, reason_code, properties):
     else:
         log.error(f"MQTT connect failed, rc={reason_code}")
 
+def on_connect_fail(client, userdata):
+    log.warning("MQTT connect attempt failed -- will retry")
 
 def on_disconnect(client, userdata, flags, reason_code, properties):
     log.warning(f"MQTT disconnected (rc={reason_code}) - paho will attempt to reconnect")
@@ -432,6 +434,10 @@ def main():
     import paho.mqtt.client as mqtt
     from paho.mqtt.client import CallbackAPIVersion
 
+    if load_state().get("power"):
+        log.warning("Persisted state is power=on at startup - arming failsafe")
+        arm_failsafe()
+
     env = load_env()
     host = env.get("MQTT_HOST")
     if not host:
@@ -466,7 +472,11 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    client.connect(host, port, keepalive=30)
+#    client.connect(host, port, keepalive=30)
+#    client.loop_forever(retry_first_connection=True)
+    client.reconnect_delay_set(min_delay=1, max_delay=30)
+    client.on_connefct_faili = on_connect_fail
+    client.connect_async(host, port, keepalive=30)
     client.loop_forever(retry_first_connection=True)
 
 
