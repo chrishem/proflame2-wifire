@@ -266,7 +266,7 @@ def validate_and_merge(payload: dict, persisted: dict):
 
 def get_max_on_minutes():
     env = load_env()
-    raw = env.get("FIREPLACE_MAX_ON_MINUTES", "60")
+    raw = env.get("FIREPLACE_MAX_ON_MINUTES", "150")    # ENV or default of 2.5hr
     try:
         return int(raw)
     except ValueError:
